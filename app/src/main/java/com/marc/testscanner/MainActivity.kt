@@ -1,9 +1,13 @@
 package com.marc.testscanner
 
 import android.Manifest
+import android.app.PendingIntent
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanSettings
+import android.bluetooth.le.ScanResult as BleScanResult
 import android.content.BroadcastReceiver
 import android.content.ContentValues
 import android.content.Context
@@ -16,9 +20,10 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.Uri
-import android.net.wifi.ScanResult
 import android.net.wifi.WifiManager
+import android.net.wifi.ScanResult as WifiScanResult
 import android.nfc.NfcAdapter
+import android.nfc.Tag
 import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
@@ -108,6 +113,7 @@ class MainActivity : ComponentActivity() {
                     device?.let { dev ->
                         val distance = if (rssi != Short.MIN_VALUE) calculateDistance(rssi.toInt()) else "Unknown"
                         val manufacturer = getManufacturerFromMac(dev.address)
+                        val name = try { dev.name ?: "Unknown Device" } catch (e: SecurityException) { "Restricted" }
                         val details = mutableMapOf(
                             "Hardware ID" to dev.address,
                             "Manufacturer" to manufacturer,
@@ -125,10 +131,36 @@ class MainActivity : ComponentActivity() {
                             },
                             "Signal" to if (rssi != Short.MIN_VALUE) "$rssi dBm" else "N/A"
                         )
-                        @Suppress("DEPRECATION")
-                        addResult(ScanEntry("Bluetooth", dev.name ?: "Unknown Device", dev.address, signal = if (rssi != Short.MIN_VALUE) "$rssi dBm" else "", detailedData = details))
+                        addResult(ScanEntry("Bluetooth", name, dev.address, signal = if (rssi != Short.MIN_VALUE) "$rssi dBm" else "", detailedData = details))
                     }
                 }
+            }
+        }
+    }
+
+    private val bleScanCallback = object : ScanCallback() {
+        override fun onScanResult(callbackType: Int, result: BleScanResult) {
+            val device = result.device
+            val rssi = result.rssi
+            
+            if (ActivityCompat.checkSelfPermission(this@MainActivity, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+                val distance = calculateDistance(rssi)
+                val manufacturer = getManufacturerFromMac(device.address)
+                val name = try { 
+                    result.scanRecord?.deviceName ?: device.name ?: "BLE Node" 
+                } catch (e: SecurityException) { 
+                    "Restricted BLE" 
+                }
+                
+                val details = mutableMapOf(
+                    "Hardware ID" to device.address,
+                    "Manufacturer" to manufacturer,
+                    "Est. Distance" to "$distance ft",
+                    "Signal Strength" to "$rssi dBm",
+                    "Connectable" to (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) result.isConnectable.toString() else "Unknown")
+                )
+                
+                addResult(ScanEntry("Bluetooth", name, device.address, signal = "$rssi dBm", extra = "BLE Detected", detailedData = details))
             }
         }
     }
@@ -179,7 +211,6 @@ class MainActivity : ComponentActivity() {
         irManager = getSystemService(ConsumerIrManager::class.java)
         connectivityManager = getSystemService(ConnectivityManager::class.java)
 
-        // Add back press callback for "complete shut off"
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 exitApp()
@@ -192,7 +223,9 @@ class MainActivity : ComponentActivity() {
                     results = _scanResults,
                     isScanning = isScanning.value,
                     onScanToggle = { if (isScanning.value) stopScan() else startScan() },
-                    hasIr = irManager != null,
+                    hasIr = irManager?.hasIrEmitter() == true,
+                    btAvailable = bluetoothAdapter != null,
+                    nfcAvailable = nfcAdapter != null,
                     onIrTest = { testIr() },
                     onExportLogs = { exportLogs() },
                     onExportSingle = { entry -> exportSingleLog(entry) },
@@ -222,6 +255,45 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        val intent = Intent(this, javaClass).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        val pendingIntent = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_MUTABLE)
+        nfcAdapter?.enableForegroundDispatch(this, pendingIntent, null, null)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        nfcAdapter?.disableForegroundDispatch(this)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        if (NfcAdapter.ACTION_TAG_DISCOVERED == intent.action ||
+            NfcAdapter.ACTION_TECH_DISCOVERED == intent.action ||
+            NfcAdapter.ACTION_NDEF_DISCOVERED == intent.action) {
+            
+            val tag = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableExtra(NfcAdapter.EXTRA_TAG, Tag::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableExtra(NfcAdapter.EXTRA_TAG)
+            }
+            
+            tag?.let { t ->
+                val id = t.id.joinToString(":") { "%02X".format(it) }
+                val techs = t.techList.joinToString(", ")
+                val details = mapOf(
+                    "Tag ID" to id,
+                    "Technologies" to techs,
+                    "Action" to (intent.action ?: "Unknown")
+                )
+                addResult(ScanEntry("NFC", "NFC Tag Detected", id, extra = "Physical Proximity", detailedData = details))
+                Toast.makeText(this, "NFC Tag Captured!", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
     private fun openDonate() {
         val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://cash.app/\$woeismarc"))
         startActivity(intent)
@@ -230,18 +302,21 @@ class MainActivity : ComponentActivity() {
     private fun exitApp() {
         stopScan()
         finishAndRemoveTask()
-        // Force process termination to ensure it "completely shuts off" as requested
         android.os.Process.killProcess(android.os.Process.myPid())
     }
 
     private fun addResult(entry: ScanEntry) {
-        val existingIndex = _scanResults.indexOfFirst { it.address == entry.address && it.type == entry.type }
-        if (existingIndex != -1) {
-            _scanResults[existingIndex] = entry
-        } else {
-            _scanResults.add(0, entry)
+        synchronized(_scanResults) {
+            val existingIndex = _scanResults.indexOfFirst { it.address == entry.address && it.type == entry.type }
+            if (existingIndex != -1) {
+                _scanResults[existingIndex] = entry
+            } else {
+                _scanResults.add(0, entry)
+            }
         }
-        _history.add(entry)
+        synchronized(_history) {
+            _history.add(entry)
+        }
     }
 
     private fun calculateDistance(rssi: Int): String {
@@ -357,15 +432,13 @@ class MainActivity : ComponentActivity() {
                         "Est. Distance" to "$dist ft",
                         "Frequency" to "${res.frequency} MHz",
                         "Capabilities" to res.capabilities,
-                        "Signal Level" to "${res.level} dBm",
-                        "Channel Width" to (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) res.channelWidth.toString() else "N/A"),
-                        "Center Freq" to (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) res.centerFreq0.toString() else "N/A")
+                        "Signal Level" to "${res.level} dBm"
                     )
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                         details["WiFi Std"] = when(res.wifiStandard) {
-                            ScanResult.WIFI_STANDARD_11AX -> "Wi-Fi 6 (ax)"
-                            ScanResult.WIFI_STANDARD_11AC -> "Wi-Fi 5 (ac)"
-                            ScanResult.WIFI_STANDARD_11N -> "Wi-Fi 4 (n)"
+                            WifiScanResult.WIFI_STANDARD_11AX -> "Wi-Fi 6 (ax)"
+                            WifiScanResult.WIFI_STANDARD_11AC -> "Wi-Fi 5 (ac)"
+                            WifiScanResult.WIFI_STANDARD_11N -> "Wi-Fi 4 (n)"
                             else -> "Legacy"
                         }
                     }
@@ -378,12 +451,20 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-            try {
-                bluetoothAdapter?.startDiscovery()
-            } catch (e: Exception) {
-                e.printStackTrace()
+        if (bluetoothAdapter?.isEnabled == true) {
+            if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+                try {
+                    bluetoothAdapter?.startDiscovery()
+                    val settings = ScanSettings.Builder()
+                        .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                        .build()
+                    bluetoothAdapter?.bluetoothLeScanner?.startScan(null, settings, bleScanCallback)
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
             }
+        } else if (bluetoothAdapter != null) {
+            Toast.makeText(this, "Enable Bluetooth for full sniffing", Toast.LENGTH_SHORT).show()
         }
 
         scope.launch(Dispatchers.IO) {
@@ -399,10 +480,7 @@ class MainActivity : ComponentActivity() {
                             val details = mapOf(
                                 "Iface Name" to iface.name,
                                 "MAC Address" to hwAddr,
-                                "MTU" to iface.mtu.toString(),
-                                "IP" to (addr.hostAddress ?: "N/A"),
-                                "Loopback" to addr.isLoopbackAddress.toString(),
-                                "Site Local" to addr.isSiteLocalAddress.toString()
+                                "IP" to (addr.hostAddress ?: "N/A")
                             )
                             withContext(Dispatchers.Main) {
                                 addResult(ScanEntry("System", "Iface: ${iface.name}", addr.hostAddress ?: "", extra = "MAC: $hwAddr", detailedData = details))
@@ -424,6 +502,7 @@ class MainActivity : ComponentActivity() {
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
             try {
                 bluetoothAdapter?.cancelDiscovery()
+                bluetoothAdapter?.bluetoothLeScanner?.stopScan(bleScanCallback)
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -455,17 +534,13 @@ class MainActivity : ComponentActivity() {
                             val hostName = address.hostName
                             val details = mapOf(
                                 "IP Address" to testIp,
-                                "Hostname" to hostName,
-                                "Canonical" to address.canonicalHostName,
-                                "Subnet" to "$prefix.0/24",
-                                "Multicast" to address.isMulticastAddress.toString()
+                                "Hostname" to hostName
                             )
                             withContext(Dispatchers.Main) {
                                 addResult(ScanEntry("IP Scan", hostName, testIp, extra = "Live Node Detected", detailedData = details))
                             }
                         }
                     } catch (e: Exception) {
-                        // Ignore individual node scan failures
                     }
                 }
             }.joinAll()
@@ -477,6 +552,8 @@ class MainActivity : ComponentActivity() {
             if (irManager?.hasIrEmitter() == true) {
                 irManager?.transmit(38000, intArrayOf(1000, 1000, 500, 500))
                 Toast.makeText(this, "Broadcasting IR Signal...", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(this, "IR not supported on this device", Toast.LENGTH_SHORT).show()
             }
         } catch (e: Exception) {
             Toast.makeText(this, "IR Error: ${e.message}", Toast.LENGTH_SHORT).show()
@@ -488,12 +565,10 @@ class MainActivity : ComponentActivity() {
         try {
             unregisterReceiver(bluetoothReceiver)
         } catch (e: Exception) {
-            e.printStackTrace()
         }
         try {
             connectivityManager?.unregisterNetworkCallback(networkCallback)
         } catch (e: Exception) {
-            e.printStackTrace()
         }
         scope.cancel()
     }
@@ -506,6 +581,8 @@ fun MainScreen(
     isScanning: Boolean,
     onScanToggle: () -> Unit,
     hasIr: Boolean,
+    btAvailable: Boolean,
+    nfcAvailable: Boolean,
     onIrTest: () -> Unit,
     onExportLogs: () -> Unit,
     onExportSingle: (ScanEntry) -> Unit,
@@ -532,6 +609,7 @@ fun MainScreen(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { res ->
         if (res.values.all { it }) onScanToggle()
+        else onScanToggle()
     }
 
     var selectedEntry by remember { mutableStateOf<ScanEntry?>(null) }
@@ -540,7 +618,7 @@ fun MainScreen(
         AlertDialog(
             onDismissRequest = { showDonateDialog = false },
             title = { Text("Support the Developers", color = Color(0xFF03DAC6), fontFamily = FontFamily.Monospace) },
-            text = { Text("Would you like to donate to the developers to support future updates and maintenance?", color = Color.White, fontFamily = FontFamily.Monospace) },
+            text = { Text("Would you like to donate to support future updates?", color = Color.White, fontFamily = FontFamily.Monospace) },
             confirmButton = {
                 TextButton(onClick = {
                     showDonateDialog = false
@@ -594,7 +672,7 @@ fun MainScreen(
             Column(modifier = Modifier.padding(16.dp).fillMaxSize()) {
                 Box {
                     if (isScanning) SonarPulseEffect()
-                    StatusPanel(hasIr, onIrTest)
+                    StatusPanel(hasIr, btAvailable, nfcAvailable, onIrTest)
                 }
                 
                 Spacer(modifier = Modifier.height(24.dp))
@@ -883,7 +961,7 @@ fun DetailRow(label: String, value: String) {
 }
 
 @Composable
-fun StatusPanel(hasIr: Boolean, onIrTest: () -> Unit) {
+fun StatusPanel(hasIr: Boolean, btAvailable: Boolean, nfcAvailable: Boolean, onIrTest: () -> Unit) {
     Card(
         shape = RoundedCornerShape(12.dp),
         colors = CardDefaults.cardColors(containerColor = Color(0xFF0A0A0A)),
@@ -895,8 +973,8 @@ fun StatusPanel(hasIr: Boolean, onIrTest: () -> Unit) {
             Spacer(modifier = Modifier.height(16.dp))
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceAround) {
                 SensorStatus("WLAN", Icons.Default.SettingsInputAntenna, true)
-                SensorStatus("BT_LE", Icons.AutoMirrored.Filled.BluetoothSearching, true)
-                SensorStatus("NFC", Icons.Default.Contactless, true)
+                SensorStatus("BT_LE", Icons.AutoMirrored.Filled.BluetoothSearching, btAvailable)
+                SensorStatus("NFC", Icons.Default.Contactless, nfcAvailable)
                 SensorStatus("IR_TX", Icons.Default.RssFeed, hasIr)
             }
             if (hasIr) {
