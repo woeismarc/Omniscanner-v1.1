@@ -109,30 +109,28 @@ class MainActivity : ComponentActivity() {
                 
                 val rssi: Short = intent.getShortExtra(BluetoothDevice.EXTRA_RSSI, Short.MIN_VALUE)
                 
-                if (ActivityCompat.checkSelfPermission(this@MainActivity, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-                    device?.let { dev ->
-                        val distance = if (rssi != Short.MIN_VALUE) calculateDistance(rssi.toInt()) else "Unknown"
-                        val manufacturer = getManufacturerFromMac(dev.address)
-                        val name = try { dev.name ?: "Unknown Device" } catch (e: SecurityException) { "Restricted" }
-                        val details = mutableMapOf(
-                            "Hardware ID" to dev.address,
-                            "Manufacturer" to manufacturer,
-                            "Est. Distance" to "$distance ft",
-                            "Bond State" to when(dev.bondState) {
-                                BluetoothDevice.BOND_BONDED -> "Bonded"
-                                BluetoothDevice.BOND_BONDING -> "Bonding"
-                                else -> "Not Bonded"
-                            },
-                            "Type" to when(dev.type) {
-                                BluetoothDevice.DEVICE_TYPE_CLASSIC -> "Classic"
-                                BluetoothDevice.DEVICE_TYPE_LE -> "BLE"
-                                BluetoothDevice.DEVICE_TYPE_DUAL -> "Dual"
-                                else -> "Unknown"
-                            },
-                            "Signal" to if (rssi != Short.MIN_VALUE) "$rssi dBm" else "N/A"
-                        )
-                        addResult(ScanEntry("Bluetooth", name, dev.address, signal = if (rssi != Short.MIN_VALUE) "$rssi dBm" else "", detailedData = details))
-                    }
+                device?.let { dev ->
+                    val distance = if (rssi != Short.MIN_VALUE) calculateDistance(rssi.toInt()) else "Unknown"
+                    val manufacturer = getManufacturerFromMac(dev.address)
+                    val name = try { dev.name ?: "Unknown Device" } catch (e: SecurityException) { "Restricted" }
+                    val details = mutableMapOf(
+                        "Hardware ID" to dev.address,
+                        "Manufacturer" to manufacturer,
+                        "Est. Distance" to "$distance ft",
+                        "Bond State" to when(dev.bondState) {
+                            BluetoothDevice.BOND_BONDED -> "Bonded"
+                            BluetoothDevice.BOND_BONDING -> "Bonding"
+                            else -> "Not Bonded"
+                        },
+                        "Type" to when(dev.type) {
+                            BluetoothDevice.DEVICE_TYPE_CLASSIC -> "Classic"
+                            BluetoothDevice.DEVICE_TYPE_LE -> "BLE"
+                            BluetoothDevice.DEVICE_TYPE_DUAL -> "Dual"
+                            else -> "Unknown"
+                        },
+                        "Signal" to if (rssi != Short.MIN_VALUE) "$rssi dBm" else "N/A"
+                    )
+                    addResult(ScanEntry("Bluetooth", name, dev.address, signal = if (rssi != Short.MIN_VALUE) "$rssi dBm" else "", detailedData = details))
                 }
             }
         }
@@ -143,25 +141,34 @@ class MainActivity : ComponentActivity() {
             val device = result.device
             val rssi = result.rssi
             
-            if (ActivityCompat.checkSelfPermission(this@MainActivity, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-                val distance = calculateDistance(rssi)
-                val manufacturer = getManufacturerFromMac(device.address)
-                val name = try { 
-                    result.scanRecord?.deviceName ?: device.name ?: "BLE Node" 
-                } catch (e: SecurityException) { 
-                    "Restricted BLE" 
-                }
-                
-                val details = mutableMapOf(
-                    "Hardware ID" to device.address,
-                    "Manufacturer" to manufacturer,
-                    "Est. Distance" to "$distance ft",
-                    "Signal Strength" to "$rssi dBm",
-                    "Connectable" to (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) result.isConnectable.toString() else "Unknown")
-                )
-                
-                addResult(ScanEntry("Bluetooth", name, device.address, signal = "$rssi dBm", extra = "BLE Detected", detailedData = details))
+            val distance = calculateDistance(rssi)
+            val manufacturer = getManufacturerFromMac(device.address)
+            val name = try { 
+                result.scanRecord?.deviceName ?: device.name ?: "BLE Node" 
+            } catch (e: SecurityException) { 
+                "Restricted BLE" 
             }
+            
+            val details = mutableMapOf(
+                "Hardware ID" to device.address,
+                "Manufacturer" to manufacturer,
+                "Est. Distance" to "$distance ft",
+                "Signal Strength" to "$rssi dBm",
+                "Connectable" to (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) result.isConnectable.toString() else "Unknown")
+            )
+            
+            addResult(ScanEntry("Bluetooth", name, device.address, signal = "$rssi dBm", extra = "BLE Detected", detailedData = details))
+        }
+        
+        override fun onScanFailed(errorCode: Int) {
+            val errorMsg = when (errorCode) {
+                SCAN_FAILED_ALREADY_STARTED -> "BLE scan already in progress"
+                SCAN_FAILED_APPLICATION_REGISTRATION_FAILED -> "Failed to register BLE scan callback"
+                SCAN_FAILED_INTERNAL_ERROR -> "Internal BLE scan error"
+                SCAN_FAILED_FEATURE_UNSUPPORTED -> "BLE scanning not supported"
+                else -> "Unknown BLE scan error: $errorCode"
+            }
+            Toast.makeText(this@MainActivity, errorMsg, Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -452,16 +459,31 @@ class MainActivity : ComponentActivity() {
         }
 
         if (bluetoothAdapter?.isEnabled == true) {
-            if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            val hasBluetoothScanPermission = Build.VERSION.SDK_INT < Build.VERSION_CODES.S || 
+                ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
+            
+            if (hasBluetoothScanPermission) {
                 try {
                     bluetoothAdapter?.startDiscovery()
-                    val settings = ScanSettings.Builder()
-                        .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-                        .build()
-                    bluetoothAdapter?.bluetoothLeScanner?.startScan(null, settings, bleScanCallback)
                 } catch (e: Exception) {
-                    e.printStackTrace()
+                    Toast.makeText(this, "Failed to start classic Bluetooth scan: ${e.message}", Toast.LENGTH_SHORT).show()
                 }
+                
+                try {
+                    val bleScanner = bluetoothAdapter?.bluetoothLeScanner
+                    if (bleScanner != null) {
+                        val settings = ScanSettings.Builder()
+                            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                            .build()
+                        bleScanner.startScan(null, settings, bleScanCallback)
+                    } else {
+                        Toast.makeText(this, "BLE Scanner unavailable", Toast.LENGTH_SHORT).show()
+                    }
+                } catch (e: Exception) {
+                    Toast.makeText(this, "Failed to start BLE scan: ${e.message}", Toast.LENGTH_SHORT).show()
+                }
+            } else {
+                Toast.makeText(this, "Bluetooth scan permission denied", Toast.LENGTH_SHORT).show()
             }
         } else if (bluetoothAdapter != null) {
             Toast.makeText(this, "Enable Bluetooth for full sniffing", Toast.LENGTH_SHORT).show()
@@ -499,9 +521,17 @@ class MainActivity : ComponentActivity() {
 
     private fun stopScan() {
         isScanning.value = false
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+        val hasBluetoothScanPermission = Build.VERSION.SDK_INT < Build.VERSION_CODES.S || 
+            ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
+        
+        if (hasBluetoothScanPermission) {
             try {
                 bluetoothAdapter?.cancelDiscovery()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+            
+            try {
                 bluetoothAdapter?.bluetoothLeScanner?.stopScan(bleScanCallback)
             } catch (e: Exception) {
                 e.printStackTrace()
