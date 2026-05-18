@@ -91,6 +91,7 @@ class MainActivity : ComponentActivity() {
     private var nfcAdapter: NfcAdapter? = null
     private var irManager: ConsumerIrManager? = null
     private var connectivityManager: ConnectivityManager? = null
+    private lateinit var macResolver: MacResolver
 
     private val _scanResults = mutableStateListOf<ScanEntry>()
     private val _history = mutableStateListOf<ScanEntry>()
@@ -98,6 +99,7 @@ class MainActivity : ComponentActivity() {
     private val scope = CoroutineScope(Dispatchers.Main + Job())
 
     private val bluetoothReceiver = object : BroadcastReceiver() {
+        @Suppress("MissingPermission")
         override fun onReceive(context: Context?, intent: Intent?) {
             if (BluetoothDevice.ACTION_FOUND == intent?.action) {
                 val device: BluetoothDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -111,7 +113,7 @@ class MainActivity : ComponentActivity() {
                 
                 device?.let { dev ->
                     val distance = if (rssi != Short.MIN_VALUE) calculateDistance(rssi.toInt()) else "Unknown"
-                    val manufacturer = getManufacturerFromMac(dev.address)
+                    val manufacturer = macResolver.resolveMacBlocking(dev.address)
                     val name = try { dev.name ?: "Unknown Device" } catch (e: SecurityException) { "Restricted" }
                     val details = mutableMapOf(
                         "Hardware ID" to dev.address,
@@ -142,7 +144,7 @@ class MainActivity : ComponentActivity() {
             val rssi = result.rssi
             
             val distance = calculateDistance(rssi)
-            val manufacturer = getManufacturerFromMac(device.address)
+            val manufacturer = macResolver.resolveMacBlocking(device.address)
             val name = try { 
                 result.scanRecord?.deviceName ?: device.name ?: "BLE Node" 
             } catch (e: SecurityException) { 
@@ -211,6 +213,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
+        macResolver = MacResolver(this)
         wifiManager = applicationContext.getSystemService(WifiManager::class.java)
         val bluetoothManager = getSystemService(BluetoothManager::class.java)
         bluetoothAdapter = bluetoothManager?.adapter
@@ -334,29 +337,6 @@ class MainActivity : ComponentActivity() {
         return "%.1f".format(distFeet)
     }
 
-    private fun getManufacturerFromMac(mac: String): String {
-        val cleanMac = mac.uppercase().replace(":", "").take(6)
-        return when (cleanMac) {
-            "00000C" -> "Cisco"
-            "0005CD" -> "Apple"
-            "0017F2" -> "Apple"
-            "001C20" -> "Samsung"
-            "002312" -> "Apple"
-            "002500" -> "Apple"
-            "0026BB" -> "Apple"
-            "28CFDA" -> "Apple"
-            "3C15C2" -> "Samsung"
-            "404D7F" -> "Google"
-            "54E43A" -> "Google"
-            "84253F" -> "Apple"
-            "ACAFB9" -> "Samsung"
-            "B827EB" -> "Raspberry Pi"
-            "DC215C" -> "Apple"
-            "E4E749" -> "Samsung"
-            else -> "Unknown/Generic"
-        }
-    }
-
     private fun exportSingleLog(entry: ScanEntry) {
         val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date(entry.timestamp))
         val fileName = "Omniscanner_Single_${entry.type}_$timestamp.csv"
@@ -432,7 +412,7 @@ class MainActivity : ComponentActivity() {
                 wifiManager?.startScan()
                 wifiManager?.scanResults?.forEach { res ->
                     val dist = calculateDistance(res.level)
-                    val manufacturer = getManufacturerFromMac(res.BSSID)
+                    val manufacturer = macResolver.resolveMacBlocking(res.BSSID)
                     val details = mutableMapOf(
                         "BSSID (MAC)" to res.BSSID,
                         "Manufacturer" to manufacturer,
